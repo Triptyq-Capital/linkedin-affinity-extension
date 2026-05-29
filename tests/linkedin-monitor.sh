@@ -43,8 +43,20 @@ fi
 
 # 2. LinkedIn Selector Stability
 if [[ -z "$LI_AT" || -z "$JSESSIONID" ]]; then
-  log "⚠️ Missing LinkedIn credentials. Skipping UI check."
-  exit 0
+  log "⚠️ Missing LinkedIn credentials. Skipping live UI check."
+  # No creds in this environment. Run a static check and emit SKIPPED (not a
+  # silent exit) so the Navigator reports a known, non-degrading state rather
+  # than UNKNOWN — a missing status file looks like a dead monitor.
+  MANIFEST="$REPORT_DIR/../Extension/manifest.json"
+  if [[ -f "$MANIFEST" ]] && node -e "JSON.parse(require('fs').readFileSync('$MANIFEST','utf8'))" 2>/dev/null; then
+    update_status "SKIPPED" "Static config OK (manifest valid); live LinkedIn UI check skipped - no credentials in this environment"
+    log "⏭️  Wrote SKIPPED status (static config valid)."
+    exit 0
+  else
+    update_status "FAILED" "Extension manifest.json missing or invalid"
+    log "❌ manifest.json missing or invalid."
+    exit 1
+  fi
 fi
 
 log "🚀 Starting monitor: LinkedIn UI Selectors"
