@@ -908,14 +908,17 @@ describe('getNotesForPerson', () => {
     expect(result).toHaveLength(1);
   });
 
-  test('returns empty array on error', async () => {
-    global.fetch.mockImplementationOnce(() =>
-      Promise.reject(new Error('API error'))
-    );
+  test('throws on error (fail closed, not empty array)', async () => {
+    // A fetch failure must NOT look like "no notes" — that would let the caller
+    // re-post a whole conversation as a duplicate. getNotesForPerson now propagates.
+    // reject every retry attempt (MAX_RETRIES=2 -> up to 3 calls), without leaking
+    // a persistent mock into later tests
+    global.fetch
+      .mockImplementationOnce(() => Promise.reject(new Error('API error')))
+      .mockImplementationOnce(() => Promise.reject(new Error('API error')))
+      .mockImplementationOnce(() => Promise.reject(new Error('API error')));
 
-    const result = await getNotesForPerson(123);
-
-    expect(result).toEqual([]);
+    await expect(getNotesForPerson(123)).rejects.toThrow();
   });
 });
 
@@ -980,16 +983,20 @@ describe('checkDuplicateAndGetExistingMessages', () => {
     expect(result.existingMessageContents.has('Second message')).toBe(true);
   });
 
-  test('returns fail-open on error', async () => {
-    global.fetch.mockImplementationOnce(() =>
-      Promise.reject(new Error('API error'))
-    );
+  test('returns verificationFailed on error (fail closed)', async () => {
+    // Could not read notes -> must not claim "not a duplicate". Flags the failure
+    // so the caller aborts instead of silently re-posting the conversation.
+    global.fetch
+      .mockImplementationOnce(() => Promise.reject(new Error('API error')))
+      .mockImplementationOnce(() => Promise.reject(new Error('API error')))
+      .mockImplementationOnce(() => Promise.reject(new Error('API error')));
 
     const result = await checkDuplicateAndGetExistingMessages(
       'https://linkedin.com/messaging/thread/123',
       456
     );
 
+    expect(result.verificationFailed).toBe(true);
     expect(result.isDuplicate).toBe(false);
     expect(result.existingMessageContents.size).toBe(0);
   });

@@ -97,6 +97,9 @@ async function getApiKey() {
 /**
  * Make authenticated request to Affinity API
  */
+const AFFINITY_TIMEOUT_MS = 15000;   // no request may hang forever (MV3 worker would stall)
+const AFFINITY_MAX_RETRIES = 2;      // transient 429/5xx/network only
+
 async function affinityRequest(endpoint, options = {}) {
   const apiKey = await getApiKey();
 
@@ -105,22 +108,49 @@ async function affinityRequest(endpoint, options = {}) {
   }
 
   const url = `${AFFINITY_API_BASE}${endpoint}`;
+  let lastErr;
 
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Basic ${btoa(':' + apiKey)}`,
-      'Content-Type': 'application/json',
-      ...options.headers
+  for (let attempt = 0; attempt <= AFFINITY_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), AFFINITY_TIMEOUT_MS);
+    let response;
+    try {
+      response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          'Authorization': `Basic ${btoa(':' + apiKey)}`,
+          'Content-Type': 'application/json',
+          ...options.headers
+        }
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err;   // network failure or AbortError (timeout)
+      if (attempt < AFFINITY_MAX_RETRIES) {
+        await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+        continue;
+      }
+      throw err;
     }
-  });
+    clearTimeout(timer);
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Affinity API error (${response.status}): ${errorText}`);
+    // Retry transient rate-limit / server errors with backoff before giving up
+    if ((response.status === 429 || response.status >= 500) && attempt < AFFINITY_MAX_RETRIES) {
+      lastErr = new Error(`Affinity API error (${response.status})`);
+      await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+      continue;
+    }
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Affinity API error (${response.status}): ${errorText}`);
+    }
+
+    return response.json();
   }
 
-  return response.json();
+  throw lastErr || new Error('Affinity request failed');
 }
 
 /**
@@ -406,9 +436,16 @@ async function findOrCreateOrganization(companyName) {
   const matches = await searchOrganization(companyName);
 
   if (matches.length > 0) {
-    // Return the best match (first result)
-    console.log('[LinkedIn to Affinity] Found existing organization:', matches[0].name);
-    return matches[0];
+    // Only reuse a match whose name matches EXACTLY (case-insensitive). Affinity's
+    // term search is fuzzy, and blindly taking matches[0] linked contacts to the
+    // wrong company. A wrong link is worse (and harder to spot) than a duplicate.
+    const want = companyName.trim().toLowerCase();
+    const exact = matches.find(m => (m.name || '').trim().toLowerCase() === want);
+    if (exact) {
+      console.log('[LinkedIn to Affinity] Found existing organization (exact match):', exact.name);
+      return exact;
+    }
+    console.warn(`[LinkedIn to Affinity] Org search for "${companyName}" returned ${matches.length} fuzzy match(es) but no exact name match — creating a new org rather than risk a wrong link.`);
   }
 
   // Create new organization
@@ -1518,7 +1555,10 @@ async function getNotesForPerson(personId) {
     return notes;
   } catch (error) {
     console.error('[LinkedIn to Affinity] Error getting notes:', error);
-    return [];
+    // Do NOT return [] here: a fetch failure is indistinguishable from "no notes",
+    // and the duplicate check would then re-post the whole conversation. Propagate
+    // so the caller can fail closed.
+    throw error;
   }
 }
 
@@ -1673,8 +1713,10 @@ async function checkDuplicateAndGetExistingMessages(conversationUrl, personId) {
     };
   } catch (error) {
     console.error('[LinkedIn to Affinity] Error checking duplicate:', error);
-    // On error, allow sending (fail open)
-    return { isDuplicate: false, existingMessageContents: new Set(), notesByDay: new Map() };
+    // Fail CLOSED: we could not read existing notes, so we must NOT claim "not a
+    // duplicate" — that silently re-posts the entire conversation on a transient
+    // API blip. Flag the failure so the caller aborts (forceSend can override).
+    return { verificationFailed: true, isDuplicate: false, existingMessageContents: new Set(), notesByDay: new Map() };
   }
 }
 
@@ -1765,6 +1807,19 @@ async function sendToAffinityWithPerson(personId, conversationData, forceSend = 
 
   // Check for existing messages and get notes by day
   const duplicateCheck = await checkDuplicateAndGetExistingMessages(conversationData.conversationUrl, personId);
+
+  // Fail CLOSED on a verification failure: if we couldn't read existing notes we
+  // don't know whether this is a duplicate, so creating notes now risks posting the
+  // whole conversation twice. Abort with a retryable error; forceSend overrides.
+  if (duplicateCheck.verificationFailed && !forceSend) {
+    console.warn('[LinkedIn to Affinity] Duplicate verification failed — aborting to avoid a duplicate note.');
+    return {
+      success: false,
+      needsRetry: true,
+      personId: personId,
+      error: 'Could not verify existing notes (Affinity API error). Not sending, to avoid a duplicate — please retry, or use Force Send to override.'
+    };
+  }
 
   // Filter to only new messages (not already in any note)
   const originalMessages = conversationData.messages || [];
