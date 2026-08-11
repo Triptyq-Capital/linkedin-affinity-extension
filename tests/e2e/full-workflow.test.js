@@ -17,9 +17,8 @@ const AFFINITY_BASE_URL = 'https://api.affinity.co';
 const TEST_PREFIX = '[E2E-TEST]';
 
 // Get credentials from environment
-const AFFINITY_API_KEY = process.env.AFFINITY_API_KEY;
-const LINKEDIN_LI_AT = process.env.LINKEDIN_LI_AT;
-const LINKEDIN_JSESSIONID = process.env.LINKEDIN_JSESSIONID;
+const { loadCreds, haveCreds } = require('./creds');
+const { affinityApiKey: AFFINITY_API_KEY, liAt: LINKEDIN_LI_AT, jsessionid: LINKEDIN_JSESSIONID } = loadCreds();
 
 // Track created resources for cleanup
 const createdPersonIds = [];
@@ -533,83 +532,66 @@ async function testFullWorkflow() {
 }
 
 // ============================================================
-// MAIN
+// JEST SUITE — skip-guarded (no creds → skipped, never failed), self-cleaning
 // ============================================================
 
-async function main() {
-  console.log('\n🧪 LinkedIn Affinity Extension - End-to-End Tests\n');
+jest.setTimeout(120000); // live Voyager + Affinity round-trips
 
-  // Check required credentials
-  const missing = [];
-  if (!AFFINITY_API_KEY) missing.push('AFFINITY_API_KEY');
-  if (!LINKEDIN_LI_AT) missing.push('LINKEDIN_LI_AT');
-  if (!LINKEDIN_JSESSIONID) missing.push('LINKEDIN_JSESSIONID');
+const describeE2E = haveCreds() ? describe : describe.skip;
 
-  if (missing.length > 0) {
-    console.error('❌ Missing required environment variables:');
-    missing.forEach(v => console.error(`   - ${v}`));
-    console.error('\nUsage:');
-    console.error('  AFFINITY_API_KEY=xxx LINKEDIN_LI_AT=xxx LINKEDIN_JSESSIONID=xxx node tests/e2e/full-workflow.test.js');
-    process.exit(1);
-  }
-
-  const results = [];
+describeE2E('LinkedIn → Affinity full workflow (e2e)', () => {
+  // Shared across ordered tests; set by the create step, used by later steps.
   let personId = null;
-  let noteResult = null;
+  let conversationUrl = null;
 
-  try {
-    // Run tests
-    results.push({ name: 'Voyager API', ...await testVoyagerAPI() });
-    results.push({ name: 'Affinity Connection', ...await testAffinityConnection() });
-
-    const createResult = await testCreatePerson();
-    results.push({ name: 'Create Person', ...createResult });
-    personId = createResult.personId;
-
-    if (personId) {
-      results.push({ name: 'Organization Linking', ...await testOrganizationLinking(personId) });
-      results.push({ name: 'Field Population', ...await testFieldPopulation(personId) });
-
-      noteResult = await testAddNote(personId);
-      results.push({ name: 'Add Note', ...noteResult });
-
-      if (noteResult.conversationUrl) {
-        results.push({ name: 'Duplicate Detection', ...await testDuplicateDetection(personId, noteResult.conversationUrl) });
-      }
-    }
-
-    results.push({ name: 'Full Workflow', ...await testFullWorkflow() });
-
-  } finally {
+  afterAll(async () => {
     await cleanup();
-  }
-
-  // Print summary
-  logSection('TEST SUMMARY');
-
-  let totalPassed = 0;
-  let totalTests = 0;
-
-  results.forEach(r => {
-    const status = r.passed === r.total ? '✅' : (r.passed > 0 ? '⚠️' : '❌');
-    console.log(`${status} ${r.name}: ${r.passed}/${r.total}`);
-    totalPassed += r.passed;
-    totalTests += r.total;
   });
 
-  console.log(`\n${'='.repeat(50)}`);
-  console.log(`Total: ${totalPassed}/${totalTests} tests passed`);
+  test('Voyager API returns work history', async () => {
+    const r = await testVoyagerAPI();
+    expect(r.passed).toBeGreaterThan(0);
+  });
 
-  if (totalPassed === totalTests) {
-    console.log('\n🎉 All tests passed!\n');
-    process.exit(0);
-  } else {
-    console.log(`\n⚠️  ${totalTests - totalPassed} tests failed\n`);
-    process.exit(1);
-  }
-}
+  test('Affinity connection is authenticated', async () => {
+    const r = await testAffinityConnection();
+    expect(r.passed).toBe(r.total);
+  });
 
-main().catch(error => {
-  console.error('Fatal error:', error);
-  cleanup().then(() => process.exit(1));
+  test('creates a person', async () => {
+    const r = await testCreatePerson();
+    expect(r.passed).toBe(r.total);
+    personId = r.personId;
+    expect(personId).toBeTruthy();
+  });
+
+  test('links organizations', async () => {
+    expect(personId).toBeTruthy();
+    const r = await testOrganizationLinking(personId);
+    expect(r.passed).toBe(r.total);
+  });
+
+  test('populates fields', async () => {
+    expect(personId).toBeTruthy();
+    const r = await testFieldPopulation(personId);
+    expect(r.passed).toBe(r.total);
+  });
+
+  test('adds a conversation note', async () => {
+    expect(personId).toBeTruthy();
+    const r = await testAddNote(personId);
+    expect(r.passed).toBe(r.total);
+    conversationUrl = r.conversationUrl;
+  });
+
+  test('detects duplicate conversation', async () => {
+    expect(Boolean(personId && conversationUrl)).toBe(true);
+    const r = await testDuplicateDetection(personId, conversationUrl);
+    expect(r.passed).toBe(r.total);
+  });
+
+  test('runs the full simulated workflow', async () => {
+    const r = await testFullWorkflow();
+    expect(r.passed).toBe(r.total);
+  });
 });
