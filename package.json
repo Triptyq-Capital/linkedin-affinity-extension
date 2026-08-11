@@ -4,7 +4,8 @@
   "description": "Browser extension that captures LinkedIn conversations and sends them to Affinity CRM",
   "private": true,
   "scripts": {
-    "test": "jest --testPathIgnorePatterns=integration",
+    "test": "jest --selectProjects unit",
+    "test:e2e": "jest --selectProjects e2e",
     "test:watch": "jest --watch --testPathIgnorePatterns=integration",
     "test:coverage": "jest --coverage --testPathIgnorePatterns=integration",
     "test:integration": "jest --testPathPattern=integration --runInBand",
